@@ -1,0 +1,50 @@
+name: LinkedIn Profile Scraper
+
+on:
+  workflow_dispatch: # Cho phép bấm nút "Run workflow" bằng tay bất cứ lúc nào
+  schedule:
+    - cron: '*/30 * * * *' # Tự động chạy định kỳ mỗi 30 phút (tùy chọn)
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Google Chrome Headless
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget curl unzip libxi6 libgconf-2-4 libnss3
+          wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
+          sudo apt install -y ./google-chrome-stable_current_amd64.deb
+
+      - name: Install Python Dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Scraper Script
+        env:
+          SERVICE_ACCOUNT_JSON: ${{ secrets.SERVICE_ACCOUNT_JSON }}
+          LINKEDIN_USERNAME: ${{ secrets.LINKEDIN_USERNAME }}
+          LINKEDIN_PASSWORD: ${{ secrets.LINKEDIN_PASSWORD }}
+          LINKEDIN_COOKIES_B64: ${{ secrets.LINKEDIN_COOKIES_B64 }}
+          SHEET_ID_OR_URL: ${{ secrets.SHEET_ID_OR_URL }}
+          INPUT_TAB_NAME: ${{ secrets.INPUT_TAB_NAME }}
+        run: python scraper.py
+
+      - name: Upload Debug Screenshots (If any failure)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-screenshots
+          path: '*.png'
+          if-no-files-found: ignore
