@@ -1,9 +1,9 @@
 name: LinkedIn Profile Scraper
 
 on:
-  workflow_dispatch: # Cho phép bấm nút "Run workflow" bằng tay bất cứ lúc nào
+  workflow_dispatch: # Cho phép bấm nút "Run workflow" thủ công
   schedule:
-    - cron: '*/30 * * * *' # Tự động chạy định kỳ mỗi 30 phút (tùy chọn)
+    - cron: '*/30 * * * *' # Tùy chọn tự động chạy định kỳ
 
 jobs:
   scrape:
@@ -19,16 +19,9 @@ jobs:
           python-version: '3.11'
           cache: 'pip'
 
-      - name: Install Google Chrome Headless
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y wget curl unzip libxi6 libgconf-2-4 libnss3
-          wget https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
-          sudo apt install -y ./google-chrome-stable_current_amd64.deb
-
       - name: Install Python Dependencies
         run: |
-          pip install --upgrade pip
+          python -m pip install --upgrade pip
           pip install -r requirements.txt
 
       - name: Run Scraper Script
