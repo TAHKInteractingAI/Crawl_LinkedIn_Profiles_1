@@ -5,7 +5,6 @@ import random
 import gspread
 import re
 import json
-import base64
 from google.oauth2.service_account import Credentials
 
 from selenium import webdriver
@@ -24,10 +23,9 @@ INPUT_TAB_NAME = os.getenv('INPUT_TAB_NAME', 'Sheet1')
 
 USERNAME = os.getenv('LINKEDIN_USERNAME', 'ray@sam-foundation.org')
 PASSWORD = os.getenv('LINKEDIN_PASSWORD', 'passnotE@1234')
-LINKEDIN_COOKIES_B64 = os.getenv('LINKEDIN_COOKIES_B64', '')
+LINKEDIN_LI_AT = os.getenv('LINKEDIN_LI_AT', '').strip()
 
 COOKIES_FILE = 'linkedin_cookies.pkl'
-CREDENTIALS_FILE = 'linkedin_credentials.pkl'
 
 # ==========================================
 # 1. SETUP DRIVER (HEADLESS CHROME)
@@ -47,7 +45,7 @@ def setup_driver():
 
     service = Service(ChromeDriverManager().install())
     driver = webdriver.Chrome(service=service, options=options)
-    driver.set_page_load_timeout(30)
+    driver.set_page_load_timeout(35)
     driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
     return driver
 
@@ -76,63 +74,42 @@ def connect_google_sheet():
         return None
 
 # ==========================================
-# 3. LOGIN (CHỐNG LỖI SUBMIT BUTTON & CHUẨN CLOUD)
+# 3. ĐĂNG NHẬP LINKEDIN BẰNG LI_AT
 # ==========================================
 def login_linkedin(driver):
     print("INFO: Đang truy cập LinkedIn...")
-    driver.get("https://www.linkedin.com/login")
-    time.sleep(3)
 
-    # 1. Khôi phục Cookie từ Secret (nếu được cung cấp)
-    if LINKEDIN_COOKIES_B64:
-        print("INFO: Đang thử đăng nhập bằng Cookie từ GitHub Secret...")
+    # Ưu tiên đăng nhập bằng Cookie li_at từ Secret
+    if LINKEDIN_LI_AT:
+        print("INFO: Đang nạp Cookie 'li_at' từ GitHub Secret...")
         try:
-            cookies_json = base64.b64decode(LINKEDIN_COOKIES_B64).decode('utf-8')
-            cookies = json.loads(cookies_json)
-            for cookie in cookies:
-                cookie.pop('sameSite', None)
-                try:
-                    driver.add_cookie(cookie)
-                except Exception:
-                    pass
-            driver.get("https://www.linkedin.com/feed")
-            time.sleep(4)
-            if "feed" in driver.current_url or driver.find_elements(By.CLASS_NAME, 'global-nav__me-photo'):
-                print("INFO: Đăng nhập thành công bằng Cookie Secret!")
-                return True
-        except Exception as e:
-            print(f"⚠️ Lỗi khi nạp Cookie từ Secret: {e}")
-
-    # 2. Thử đăng nhập bằng Cookies file cũ (nếu có lưu cache)
-    if os.path.exists(COOKIES_FILE):
-        print("INFO: Đang thử đăng nhập bằng Cookies file cache...")
-        try:
-            with open(COOKIES_FILE, "rb") as f:
-                cookies = pickle.load(f)
-                for cookie in cookies:
-                    try: driver.add_cookie(cookie)
-                    except: pass
-
-            driver.get("https://www.linkedin.com/feed")
-            time.sleep(4)
+            driver.get("https://www.linkedin.com/404")
+            time.sleep(2)
+            driver.add_cookie({
+                'name': 'li_at',
+                'value': LINKEDIN_LI_AT,
+                'domain': '.linkedin.com',
+                'path': '/',
+                'secure': True,
+                'httpOnly': True
+            })
+            driver.get("https://www.linkedin.com/feed/")
+            time.sleep(5)
 
             if "feed" in driver.current_url or driver.find_elements(By.CLASS_NAME, 'global-nav__me-photo'):
-                print("INFO: Đăng nhập thành công bằng Cookies cache!")
+                print("✅ Đăng nhập thành công với Secret 'li_at'!")
                 return True
             else:
-                print("⚠️ Cookies hỏng hoặc hết hạn. Tiến hành đăng nhập lại...")
-                driver.delete_all_cookies()
+                print("⚠️ Cookie 'li_at' đã hết hạn hoặc không đúng giá trị.")
         except Exception as e:
-            print(f"⚠️ Lỗi đọc Cookies file: {e}")
-            driver.delete_all_cookies()
+            print(f"⚠️ Lỗi khi nạp li_at: {e}")
 
-    # 3. Mở lại trang Login nếu chưa logged in
-    print("INFO: Mở lại trang đăng nhập để điền Credentials...")
+    # Fallback thử đăng nhập bằng Mật khẩu
+    print("INFO: Đang thử đăng nhập bằng Username/Password...")
     driver.get("https://www.linkedin.com/login")
     time.sleep(3)
 
     try:
-        # Bỏ qua Cookie Banner nếu đè màn hình
         try:
             cookie_btn = driver.find_element(By.XPATH, "//button[contains(@data-tracking-control-name, 'cookie') or contains(text(), 'Accept') or contains(text(), 'Accepteren')]")
             driver.execute_script("arguments[0].click();", cookie_btn)
@@ -140,127 +117,29 @@ def login_linkedin(driver):
         except Exception:
             pass
 
-        # Tìm ô Username đang HIỂN THỊ
-        username_element = None
-        selectors_user = [
-            (By.ID, "username"),
-            (By.ID, "session_key"),
-            (By.NAME, "session_key"),
-            (By.CSS_SELECTOR, "input[name='session_key']"),
-            (By.CSS_SELECTOR, "input#username")
-        ]
+        user_input = WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.ID, "username")))
+        user_input.clear()
+        user_input.send_keys(USERNAME)
 
-        for by, sel in selectors_user:
-            try:
-                el = WebDriverWait(driver, 2).until(
-                    EC.visibility_of_element_located((by, sel))
-                )
-                if el and el.is_displayed():
-                    username_element = el
-                    break
-            except Exception:
-                continue
-
-        if not username_element:
-            inputs = driver.find_elements(By.TAG_NAME, "input")
-            for inp in inputs:
-                if inp.is_displayed() and inp.get_attribute("type") in ["text", "email"]:
-                    username_element = inp
-                    break
-
-        if not username_element:
-            print("❌ Không tìm thấy ô nhập Email hiển thị.")
-            driver.save_screenshot("no_visible_input.png")
-            return False
-
-        # Điền Username
-        driver.execute_script("arguments[0].scrollIntoView(true);", username_element)
-        try:
-            username_element.clear()
-            username_element.send_keys(USERNAME)
-        except Exception:
-            driver.execute_script("arguments[0].value = arguments[1];", username_element, USERNAME)
-
-        # Tìm ô Password đang HIỂN THỊ
-        password_element = None
-        pass_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
-        for p_in in pass_inputs:
-            if p_in.is_displayed():
-                password_element = p_in
-                break
-
-        if not password_element:
-            print("❌ Không tìm thấy ô Password hiển thị.")
-            return False
-
-        # Điền Password
-        driver.execute_script("arguments[0].scrollIntoView(true);", password_element)
-        try:
-            password_element.clear()
-            password_element.send_keys(PASSWORD)
-        except Exception:
-            driver.execute_script("arguments[0].value = arguments[1];", password_element, PASSWORD)
-
+        pass_input = driver.find_element(By.ID, "password")
+        pass_input.clear()
+        pass_input.send_keys(PASSWORD)
         time.sleep(1)
 
-        # 4. GỬI FORM ĐĂNG NHẬP (Phím ENTER -> Nút bấm -> JS Submit)
-        submitted = False
-        try:
-            print("INFO: Đang gửi Form bằng phím ENTER...")
-            password_element.send_keys(Keys.ENTER)
-            submitted = True
-        except Exception as e:
-            print(f"⚠️ Không gửi được bằng phím ENTER: {e}")
-
-        if not submitted:
-            submit_selectors = [
-                (By.CSS_SELECTOR, "button[type='submit']"),
-                (By.CSS_SELECTOR, "button[data-id='sign-in-form__submit-btn']"),
-                (By.XPATH, "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'aanmelden') or contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
-                (By.XPATH, "//button[@type='submit']")
-            ]
-
-            for by, sel in submit_selectors:
-                try:
-                    btns = driver.find_elements(by, sel)
-                    for b in btns:
-                        if b.is_displayed():
-                            driver.execute_script("arguments[0].click();", b)
-                            submitted = True
-                            break
-                    if submitted:
-                        break
-                except Exception:
-                    continue
-
-        if not submitted:
-            print("INFO: Dùng JavaScript submit form trực tiếp...")
-            driver.execute_script("arguments[0].form.submit();", password_element)
-
+        pass_input.send_keys(Keys.ENTER)
         time.sleep(6)
 
-        # Kiểm tra nếu gặp Checkpoint/OTP/Authwall
-        if any(x in driver.current_url for x in ["checkpoint", "challenge", "authwall"]):
-            print("🛑 CẢNH BÁO: LinkedIn yêu cầu mã xác thực OTP hoặc Captcha!")
-            print("💡 Hãy trích xuất Cookie từ trình duyệt và lưu vào Secret LINKEDIN_COOKIES_B64.")
+        if "feed" in driver.current_url or driver.find_elements(By.CLASS_NAME, 'global-nav__me-photo'):
+            print("✅ Đăng nhập thành công bằng tài khoản và mật khẩu!")
+            return True
+        else:
+            print(f"🛑 CẢNH BÁO: LinkedIn yêu cầu OTP/Captcha tại {driver.current_url}")
+            print("💡 Vui lòng lấy lại Cookie 'li_at' từ trình duyệt và cập nhật vào GitHub Secret LINKEDIN_LI_AT.")
             driver.save_screenshot("authwall_checkpoint.png")
             return False
 
-        # 5. Kiểm tra trạng thái Đăng nhập thành công
-        if "feed" in driver.current_url or driver.find_elements(By.CLASS_NAME, 'global-nav__me-photo'):
-            with open(COOKIES_FILE, "wb") as f:
-                pickle.dump(driver.get_cookies(), f)
-            with open(CREDENTIALS_FILE, "wb") as f:
-                pickle.dump({"username": USERNAME, "password": PASSWORD}, f)
-            print("INFO: Đăng nhập thành công và đã cập nhật Cookies mới!")
-            return True
-        else:
-            print(f"ERROR: Đăng nhập chưa tới trang Feed. URL hiện tại: {driver.current_url}")
-            driver.save_screenshot("login_failed.png")
-            return False
-
     except Exception as e:
-        print(f"ERROR: Lỗi trong quá trình đăng nhập: {e}")
+        print(f"ERROR: Lỗi đăng nhập: {e}")
         driver.save_screenshot("login_error.png")
         return False
 
@@ -286,7 +165,6 @@ def crawl_profile(driver, raw_url):
                 "Company": ""
             }, "NOT_FOUND"
 
-        # Cuộn trang để nạp dữ liệu
         for _ in range(3):
             driver.execute_script("window.scrollBy(0, 500);")
             time.sleep(1)
@@ -366,7 +244,12 @@ def main():
         print("❌ Không thể kết nối Google Sheet!")
         return
 
-    ws = sh.worksheet(INPUT_TAB_NAME)
+    tab_name = (os.getenv('INPUT_TAB_NAME') or '').strip()
+    try:
+        ws = sh.worksheet(tab_name) if tab_name else sh.get_worksheet(0)
+    except Exception:
+        ws = sh.get_worksheet(0)
+
     all_rows = ws.get_all_values()
 
     driver = setup_driver()
@@ -378,12 +261,10 @@ def main():
             row_data = all_rows[i]
             url = row_data[0].strip() if len(row_data) > 0 else ""
 
-            # 1. Kiểm tra URL
             if not url or "linkedin.com/in/" not in url:
                 print(f"⏩ Dòng {i+1}: Bỏ qua do URL trống hoặc không hợp lệ.")
                 continue
 
-            # 2. Kiểm tra Cột G (Status index 6)
             if len(row_data) >= 7:
                 status_existing = row_data[6]
                 if status_existing in ["Success", "NOT_FOUND", "No Profile"]:
