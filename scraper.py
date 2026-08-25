@@ -1,9 +1,11 @@
 import os
 import time
+import pickle
 import random
 import gspread
 import re
 import json
+import base64
 from google.oauth2.service_account import Credentials
 
 from selenium import webdriver
@@ -22,7 +24,7 @@ INPUT_TAB_NAME = os.getenv('INPUT_TAB_NAME', 'Sheet1')
 
 USERNAME = os.getenv('LINKEDIN_USERNAME', 'ray@sam-foundation.org')
 PASSWORD = os.getenv('LINKEDIN_PASSWORD', 'passnotE@1234')
-LINKEDIN_LI_AT = os.getenv('LINKEDIN_LI_AT', '').strip()
+LINKEDIN_COOKIES_B64 = os.getenv('LINKEDIN_COOKIES_B64', '').strip()
 
 # ==========================================
 # 1. SETUP DRIVER (HEADLESS CHROME)
@@ -71,38 +73,53 @@ def connect_google_sheet():
         return None
 
 # ==========================================
-# 3. ĐĂNG NHẬP LINKEDIN (ƯU TIÊN LI_AT)
+# 3. ĐĂNG NHẬP LINKEDIN
 # ==========================================
 def login_linkedin(driver):
     print("INFO: Đang truy cập LinkedIn...")
+    driver.get("https://www.linkedin.com/login")
+    time.sleep(2)
 
-    # Ưu tiên đăng nhập bằng Cookie li_at từ Secret
-    if LINKEDIN_LI_AT:
-        print("INFO: Đang nạp Cookie 'li_at' từ GitHub Secret...")
+    # 1. Khôi phục Cookie từ GitHub Secret
+    if LINKEDIN_COOKIES_B64:
+        print("INFO: Đang nạp Cookie từ Secret LINKEDIN_COOKIES_B64...")
+        cookies_list = []
         try:
-            driver.get("https://www.linkedin.com/404")
-            time.sleep(2)
-            driver.add_cookie({
-                'name': 'li_at',
-                'value': LINKEDIN_LI_AT,
-                'domain': '.linkedin.com',
-                'path': '/',
-                'secure': True,
-                'httpOnly': True
-            })
-            driver.get("https://www.linkedin.com/feed/")
+            # Thử giải mã binary pickle (từ Colab)
+            try:
+                raw_bytes = base64.b64decode(LINKEDIN_COOKIES_B64)
+                cookies_list = pickle.loads(raw_bytes)
+            except Exception:
+                # Thử giải mã chuỗi JSON Base64
+                try:
+                    raw_str = base64.b64decode(LINKEDIN_COOKIES_B64).decode('utf-8')
+                    cookies_list = json.loads(raw_str)
+                except Exception:
+                    # JSON thuần
+                    cookies_list = json.loads(LINKEDIN_COOKIES_B64)
+        except Exception as e:
+            print(f"⚠️ Lỗi giải mã Cookie Secret: {e}")
+
+        if cookies_list and isinstance(cookies_list, list):
+            for cookie in cookies_list:
+                cookie.pop('sameSite', None)
+                try:
+                    driver.add_cookie(cookie)
+                except Exception:
+                    pass
+
+            driver.get("https://www.linkedin.com/feed")
             time.sleep(5)
 
             if "feed" in driver.current_url or driver.find_elements(By.CLASS_NAME, 'global-nav__me-photo'):
-                print("✅ Đăng nhập thành công với Secret 'li_at'!")
+                print("✅ Đăng nhập thành công bằng Cookies Secret!")
                 return True
             else:
-                print("⚠️ Cookie 'li_at' đã hết hạn hoặc không đúng giá trị.")
-        except Exception as e:
-            print(f"⚠️ Lỗi khi nạp li_at: {e}")
+                print("⚠️ Cookies Secret không vào được feed. Thử xóa cookie và chuyển sang login form...")
+                driver.delete_all_cookies()
 
-    # Fallback thử đăng nhập bằng Mật khẩu
-    print("INFO: Đang thử đăng nhập bằng Username/Password...")
+    # 2. Đăng nhập bằng Form (Fallback)
+    print("INFO: Mở trang đăng nhập để điền Credentials...")
     driver.get("https://www.linkedin.com/login")
     time.sleep(3)
 
@@ -114,33 +131,115 @@ def login_linkedin(driver):
         except Exception:
             pass
 
-        user_input = WebDriverWait(driver, 5).until(EC.visibility_of_element_located((By.ID, "username")))
-        user_input.clear()
-        user_input.send_keys(USERNAME)
+        username_element = None
+        selectors_user = [
+            (By.ID, "username"),
+            (By.ID, "session_key"),
+            (By.NAME, "session_key"),
+            (By.CSS_SELECTOR, "input[name='session_key']"),
+            (By.CSS_SELECTOR, "input#username")
+        ]
 
-        pass_input = driver.find_element(By.ID, "password")
-        pass_input.clear()
-        pass_input.send_keys(PASSWORD)
+        for by, sel in selectors_user:
+            try:
+                el = WebDriverWait(driver, 2).until(EC.visibility_of_element_located((by, sel)))
+                if el and el.is_displayed():
+                    username_element = el
+                    break
+            except Exception:
+                continue
+
+        if not username_element:
+            inputs = driver.find_elements(By.TAG_NAME, "input")
+            for inp in inputs:
+                if inp.is_displayed() and inp.get_attribute("type") in ["text", "email"]:
+                    username_element = inp
+                    break
+
+        if not username_element:
+            print("❌ Không tìm thấy ô nhập Email.")
+            driver.save_screenshot("no_visible_input.png")
+            return False
+
+        driver.execute_script("arguments[0].scrollIntoView(true);", username_element)
+        try:
+            username_element.clear()
+            username_element.send_keys(USERNAME)
+        except Exception:
+            driver.execute_script("arguments[0].value = arguments[1];", username_element, USERNAME)
+
+        password_element = None
+        pass_inputs = driver.find_elements(By.CSS_SELECTOR, "input[type='password']")
+        for p_in in pass_inputs:
+            if p_in.is_displayed():
+                password_element = p_in
+                break
+
+        if not password_element:
+            print("❌ Không tìm thấy ô Password.")
+            return False
+
+        driver.execute_script("arguments[0].scrollIntoView(true);", password_element)
+        try:
+            password_element.clear()
+            password_element.send_keys(PASSWORD)
+        except Exception:
+            driver.execute_script("arguments[0].value = arguments[1];", password_element, PASSWORD)
+
         time.sleep(1)
 
-        pass_input.send_keys(Keys.ENTER)
+        submitted = False
+        try:
+            password_element.send_keys(Keys.ENTER)
+            submitted = True
+        except Exception:
+            pass
+
+        if not submitted:
+            submit_selectors = [
+                (By.CSS_SELECTOR, "button[type='submit']"),
+                (By.CSS_SELECTOR, "button[data-id='sign-in-form__submit-btn']"),
+                (By.XPATH, "//button[contains(translate(text(), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'sign in')]"),
+                (By.XPATH, "//button[@type='submit']")
+            ]
+            for by, sel in submit_selectors:
+                try:
+                    btns = driver.find_elements(by, sel)
+                    for b in btns:
+                        if b.is_displayed():
+                            driver.execute_script("arguments[0].click();", b)
+                            submitted = True
+                            break
+                    if submitted:
+                        break
+                except Exception:
+                    continue
+
+        if not submitted:
+            driver.execute_script("arguments[0].form.submit();", password_element)
+
         time.sleep(6)
+
+        if any(x in driver.current_url for x in ["checkpoint", "challenge", "authwall"]):
+            print(f"🛑 CẢNH BÁO: LinkedIn yêu cầu OTP/Captcha tại {driver.current_url}")
+            driver.save_screenshot("authwall_checkpoint.png")
+            return False
 
         if "feed" in driver.current_url or driver.find_elements(By.CLASS_NAME, 'global-nav__me-photo'):
             print("✅ Đăng nhập thành công bằng tài khoản và mật khẩu!")
             return True
         else:
-            print(f"🛑 CẢNH BÁO: LinkedIn yêu cầu OTP/Captcha tại {driver.current_url}")
-            driver.save_screenshot("authwall_checkpoint.png")
+            print(f"ERROR: Chưa vào được trang Feed. URL: {driver.current_url}")
+            driver.save_screenshot("login_failed.png")
             return False
 
     except Exception as e:
-        print(f"ERROR: Lỗi đăng nhập: {e}")
+        print(f"ERROR: Lỗi trong quá trình đăng nhập: {e}")
         driver.save_screenshot("login_error.png")
         return False
 
 # ==========================================
-# 4. CRAWL DỮ LIỆU TỪ LINK PROFILE LINKEDIN
+# 4. CRAWL PROFILE
 # ==========================================
 def crawl_profile(driver, raw_url):
     try:
@@ -150,8 +249,9 @@ def crawl_profile(driver, raw_url):
         print(f"--- Processing: {url}")
         time.sleep(random.uniform(5, 7))
         page_source = driver.page_source
+        page_title = driver.title
 
-        if "This page doesn’t exist" in page_source or "Page not found" in driver.title:
+        if "This page doesn’t exist" in page_source or "Page not found" in page_title:
             print("⚠️ Cảnh báo: Hồ sơ không tồn tại (404).")
             return {
                 "Name": "No Profile",
@@ -161,36 +261,35 @@ def crawl_profile(driver, raw_url):
                 "Company": ""
             }, "NOT_FOUND"
 
-        # Cuộn trang để tải DOM đầy đủ
+        if "This page isn’t working" in page_title or "redirected you too many times" in page_source:
+            print("🛑 Lỗi Redirect Loop (ERR_TOO_MANY_REDIRECTS).")
+            driver.save_screenshot("redirect_loop_error.png")
+            return None, "REDIRECT_LOOP"
+
         for _ in range(3):
             driver.execute_script("window.scrollBy(0, 500);")
             time.sleep(1)
 
         if any(x in driver.current_url for x in ["login", "authwall", "checkpoint", "challenge"]):
-            print("Debug: Auth wall / Checkpoint detected.")
+            print("Debug: Auth wall detected.")
             driver.save_screenshot(f"authwall_{int(time.time())}.png")
             return None, "AUTH_WALL"
 
         data_js = driver.execute_script("""
             const txt = (sel) => document.querySelector(sel)?.innerText.trim() || "";
 
-            // 1. Name
-            let name = txt('h1.text-heading-xlarge') || 
-                       txt('h1.top-card-layout__title') ||
-                       txt('div.ph5 h1') ||
-                       txt('section.top-card h1') ||
-                       txt('h1') || "";
+            const sideBarElements = Array.from(document.querySelectorAll('div[role="button"]'))
+                .map(el => el.innerText.trim())
+                .filter(t => t.length > 3 && !t.includes('connection') && !t.includes('follower') && !t.includes('kết nối'));
 
-            // 2. Headline
             const lines = Array.from(document.querySelectorAll('p, div.text-body-medium'))
                 .map(el => el.innerText.trim())
                 .filter(t => t.length > 0);
 
-            let headline = txt('div.text-body-medium.break-words') ||
-                           txt('h2.top-card-layout__headline') ||
-                           lines.find(t => t.includes(" at ") || (t.length > 15 && t.length < 150)) || "";
+            const headline = txt('div.text-body-medium.break-words') ||
+                             txt('h2.top-card-layout__headline') ||
+                             lines.find(t => t.includes(" at ") || t.length > 20) || "";
 
-            // 3. Locality
             let loc = "";
             const contactAnchor = document.querySelector('a[href*="contact-info"]');
             if (contactAnchor) {
@@ -203,19 +302,11 @@ def crawl_profile(driver, raw_url):
                       txt('span[class*="location"]') || "";
             }
 
-            // 4. Company sau update
-            const sideBarElements = Array.from(document.querySelectorAll('div[role="button"], ul.overflow-hidden li, button[aria-label*="Current company"]'))
-                .map(el => el.innerText.trim())
-                .filter(t => t.length > 2 && !t.toLowerCase().includes('connection') && !t.toLowerCase().includes('follower') && !t.toLowerCase().includes('kết nối'));
-
-            let company = sideBarElements.slice(0, 2).join(" | ") || "";
-
             return {
-                name: name,
+                name: txt('h1.text-heading-xlarge') || txt('div[data-display-contents="true"] h2') || txt('h1') || "",
                 headline: headline,
                 locality: loc,
-                company: company,
-                page_title: document.title || "",
+                company: sideBarElements.slice(0, 2).join(" | ") || "",
                 connection_raw: document.body.innerText
             };
         """)
@@ -224,33 +315,29 @@ def crawl_profile(driver, raw_url):
         headline = data_js.get('headline', '').strip()
         locality = data_js.get('locality', '').strip()
         company = data_js.get('company', '').strip()
-        page_title = data_js.get('page_title', '').strip()
         conn_source = data_js.get('connection_raw', '')
 
-        # Fallback tên nếu DOM thay đổi
         if not name and page_title and "linkedin" in page_title.lower():
-            clean_p_title = page_title.split("|")[0].split(" - ")[0].split(" – ")[0].replace("Profile", "").strip()
-            if clean_p_title and len(clean_p_title) < 50:
-                name = clean_p_title
+            clean_name = page_title.split("|")[0].split(" - ")[0].split(" – ")[0].strip()
+            if clean_name and "this page" not in clean_name.lower():
+                name = clean_name
 
         if not name:
             slug = url.rstrip("/").split("/")[-1].split("?")[0]
             if slug:
                 name = " ".join([word.capitalize() for word in slug.replace("-", " ").split() if not word.isdigit()])
 
-        # Fallback công ty từ Headline
         if not company and " at " in headline:
             company = headline.split(" at ")[-1].split("|")[0].split("•")[0].strip()
         elif not company and " @ " in headline:
             company = headline.split(" @ ")[-1].split("|")[0].split("•")[0].strip()
 
-        # Connection
         connections = ""
         match = re.search(r'([\d,\.\+]+)\s*(connections|kết nối|followers|người theo dõi)', conn_source, re.I)
         if match:
             connections = f"{match.group(1)} connections"
 
-        print(f"Debug: [Name: '{name}'] | [Headline: '{headline}'] | [Loc: '{locality}'] | [Conn: '{connections}'] | [Comp: '{company}']")
+        print(f"Debug: Name: '{name}' | Headline: '{headline}' | Loc: '{locality}' | Conn: '{connections}' | Comp: '{company}'")
 
         return {
             "Name": name if name else "LinkedIn Member",
@@ -289,20 +376,17 @@ def main():
         if not login_linkedin(driver):
             return
 
-        # Quét qua từng dòng từ hàng 2 (index 1)
         for i in range(1, len(all_rows)):
             row_data = all_rows[i]
             url = row_data[0].strip() if len(row_data) > 0 else ""
 
-            # 1. Bỏ qua nếu cột A không phải là link LinkedIn
             if not url or "linkedin.com/in/" not in url:
                 continue
 
-            # 2. KIỂM TRA: Chỉ chạy nếu CỘT B TRỐNG hoặc CỘT G (Status) CHƯA CÓ SUCCESS / NOT_FOUND
             name_existing = row_data[1].strip() if len(row_data) > 1 else ""
             status_existing = row_data[6].strip() if len(row_data) > 6 else ""
 
-            if name_existing or status_existing in ["Success", "NOT_FOUND", "No Profile"]:
+            if name_existing and name_existing != "This page isn’t working" and status_existing in ["Success", "NOT_FOUND", "No Profile"]:
                 continue
 
             print(f"\n🔄 Đang xử lý dòng {i+1}: {url}")
@@ -310,14 +394,12 @@ def main():
             row = i + 1
 
             if data and data.get('Name') == "No Profile":
-                # Cột B:G khi không tìm thấy Profile
                 ws.update(range_name=f"B{row}:G{row}", values=[[
                     "No Profile", "", "", "", "", "NOT_FOUND"
                 ]])
                 print(f"   ⚠️ Dòng {row}: Profile không tồn tại (NOT_FOUND)")
 
-            elif data and status == "Success":
-                # Ghi đúng 6 cột: B(Name), C(Headline), D(Locality), E(Connections), F(Company sau update), G(Status)
+            elif data and data.get('Name') and data['Name'] not in ["No Profile", "This page isn’t working"]:
                 payload = [
                     data['Name'],
                     data['Headline'],
@@ -327,7 +409,7 @@ def main():
                     "Success"
                 ]
                 ws.update(range_name=f"B{row}:G{row}", values=[payload])
-                print(f"   ✅ Dòng {row} OK: {data['Name']} | {data['Headline']}")
+                print(f"   ✅ Dòng {row} OK: {data['Name']}")
 
             else:
                 error_msg = f"Error: {status}"
@@ -336,13 +418,13 @@ def main():
                 ]])
                 print(f"   ❌ Dòng {row}: {error_msg}")
 
-                if status == "AUTH_WALL":
-                    print("🛑 Dừng tiến trình do gặp Auth Wall!")
+                if status in ["AUTH_WALL", "REDIRECT_LOOP"]:
+                    print("🛑 Dừng tiến trình do gặp Auth Wall / Redirect Loop!")
                     break
 
             count += 1
             if count >= MAX_PROFILE:
-                print(f"🛑 Đã hoàn thành batch {MAX_PROFILE} profiles cho lần chạy này.")
+                print(f"🛑 Đã hoàn thành batch {MAX_PROFILE} profiles.")
                 break
 
             time.sleep(random.randint(3, 6))
